@@ -151,3 +151,72 @@ The AltaworxPondGetBillingGroups Lambda function synchronizes billing group data
 - **Advance**: emit progress messages to `POND_PROCESS_STAGED_BILLING_GROUPS_QUEUE_URL` for downstream processing
 - **Note**: Page-to-process tracking is staged into `POND_GET_BILLING_GROUPS_PAGE_TO_PROCESS`; downstream components can update progress via repository methods (e.g., `UpdateBillingGroupsPageStatusAndCheckSyncProgress`) as applicable
 - Shape
+
+#### Method Implementations (Detailed Explanations)
+
+- **PondRepository.GetPondAuthentication**
+  - Signature: `public virtual PondAuthentication GetPondAuthentication(Action<string, string> logFunction, IBase64Service base64Service, int serviceProviderId = 0)`
+  - Purpose: Retrieves Pond API authentication/tenant context (base URLs, distributor, credentials) for a given Service Provider.
+  - How it works:
+    - Builds parameters with `SERVICE_PROVIDER_ID`.
+    - Executes stored procedure `GET_POND_AUTHENTICATION` under SQL retry policy.
+    - Maps each row to `PondAuthentication` using the provided `IBase64Service`.
+    - Returns the first authentication record (or `null` if none).
+  - Notes:
+    - Passing `serviceProviderId = 0` lets the stored procedure decide default behavior (if any).
+    - The result determines Production vs Sandbox base URLs used in API calls.
+
+- **Function.SyncBillingGroup**
+  - Signature: `protected async Task SyncBillingGroup(AmopLambdaContext context, SqsValues sqsValues, ISyncPolicy syncPolicy, PondApiService pondApiService)`
+  - Purpose: Orchestrates fetching one page of billing groups for a specific inventory and loading them to staging, then signaling progress.
+  - How it works:
+    - Builds the endpoint: `formattedEndpoint = string.Format(PondGetBillingGroupEndpoint, sqsValues.InventoryId)`.
+    - Invokes `pondApiService.GetSinglePageListFromPondAPIAsync<PondBillingGroupItem, PondBillingGroupListResponse>` with delegates:
+      - `getFromAPIFunc(offset, pageSize)`: `pondApiService.GetPondListAsync<PondBillingGroupListResponse>(HttpClientSingleton.Instance, formattedEndpoint, offset, pageSize)`
+      - `getListFromResponseFunc(response)`: `response.Elements`
+      - `loadDataToStagingFunc(list)`: `LoadBillingGroupToStagingTable(context, list, sqsValues.ServiceProviderId)`
+      - `checkSyncStepProgressFunc(pageNumber, isSuccess)`: `CheckSyncBillingGroupStepProgress(context, sqsValues.ServiceProviderId, sqsValues.InventoryId, pageNumber, isSuccess)`
+  - Notes:
+    - Offset is derived internally as `pageNumber * PageSize` by the `GetSinglePageListFromPondAPIAsync` helper.
+    - The `syncPolicy` wraps only the staging load; HTTP requests are not retried by this policy.
+
+- **PondApiService.GetSinglePageListFromPondAPIAsync<TListItem, TAPIResponse>**
+  - Signature: `public async Task GetSinglePageListFromPondAPIAsync<TListItem, TAPIResponse>(Action<string, string> logFunction, ISyncPolicy sqlRetryPolicy, int pageNumber, int pageSize, Func<int, int, Task<TAPIResponse>> getFromAPIFunc, Func<TAPIResponse, List<TListItem>> getListFromResponseFunc, Action<List<TListItem>> loadDataToStagingFunc, Func<int, bool, Task> checkSyncStepProgressFunc)`
+  - Purpose: Generic helper to fetch a single page from Pond, transform results, persist to staging, and publish progress.
+  - How it works:
+    - Logs a sub-step marker via `logFunction`.
+    - Computes `offset = pageNumber * pageSize` and awaits `getFromAPIFunc(offset, pageSize)`.
+    - Initializes `isSuccess = false`; sets to `true` when the API response is non-null and list extraction returns a non-null list (empty list is treated as success).
+    - On null API response, logs `ERROR_NULL_API_REPONSE`.
+    - Executes `loadDataToStagingFunc(elements)` within `sqlRetryPolicy`.
+    - Awaits `checkSyncStepProgressFunc(pageNumber, isSuccess)` to signal downstream progress.
+  - Notes:
+    - This method deliberately treats “no elements” as success to advance progress tracking even when a page is empty.
+    - Any exceptions in staging load are handled by the SQL retry policy; callers should handle outer exceptions as needed.
+
+- **PondApiService.GetPondListAsync<T>**
+  - Signature: `public async Task<T> GetPondListAsync<T>(HttpClient httpClient, string endpoint, int offset = 0, int pageSize = PondHelper.CommonConfig.DEFAULT_PAGE_SIZE, IKeysysLogger logger = null)`
+  - Purpose: Performs the actual HTTP GET to Pond with pagination query parameters and deserializes the response.
+  - How it works:
+    - Logs the request tuple `(endpoint, offset, pageSize)` when a logger is provided.
+    - Chooses base URI based on environment: Production vs Sandbox from `PondAuthentication`.
+    - Builds query params via `BuildQueryParamGetInventoryList(offset, pageSize)` and appends to `{baseUri}/{DistributorId}/{endpoint}`.
+    - Creates a GET request with `BuildRequestMessage` and sends it using the provided `httpClient`.
+    - Reads `responseBody` and logs error content when the status code is non-success.
+    - Deserializes JSON into `T` via `JsonConvert.DeserializeObject<T>(responseBody)` and returns it.
+  - Notes:
+    - Non-success HTTP responses are logged but not thrown; callers must interpret `null` or failed deserialization accordingly.
+    - No built-in HTTP retry is applied here; consider wrapping at the call site if needed.
+
+- **Function.CheckSyncBillingGroupStepProgress**
+  - Signature: `private async Task CheckSyncBillingGroupStepProgress(AmopLambdaContext context, int serviceProviderId, int inventoryId, int currentPage, bool isSuccess)`
+  - Purpose: Publishes a progress message to the downstream processing queue so other steps can update status and continue the pipeline.
+  - How it works:
+    - Builds SQS message attributes:
+      - `SERVICE_PROVIDER_ID`: `serviceProviderId`
+      - `INVENTORY_ID`: `inventoryId`
+      - `PAGE_NUMBER`: `currentPage`
+      - `IS_SUCCESSFUL`: `isSuccess`
+    - Sends the message to `ProcessStagedBillingGroupsQueueURL` via `SqsService.SendSQSMessage`.
+  - Notes:
+    - Downstream processors can call `PondRepository.UpdateBillingGroupsPageStatusAndCheckSyncProgress` to persist progress and determine overall completion.
